@@ -1,127 +1,72 @@
-name: Build App From ZIP
+name: Unzip And Build Android APK
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build-apk:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Find project ZIP
-        shell: pwsh
+        id: findzip
+        shell: bash
         run: |
-          $zip = Get-ChildItem -Path . -Filter "*.zip" -Recurse |
-            Where-Object { $_.Name -like "*file-ai-assistant*" } |
-            Select-Object -First 1
-
-          if (-not $zip) {
-            Write-Error "Aucun ZIP File AI Assistant trouvé dans le dépôt."
+          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Aucun ZIP trouvé."
             exit 1
-          }
+          fi
+          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-          echo "PROJECT_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
-          Write-Host "ZIP trouvé : $($zip.FullName)"
-
-      - name: Unzip project
-        shell: pwsh
+      - name: Extract project
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path extracted | Out-Null
-          Expand-Archive -Path "$env:PROJECT_ZIP" -DestinationPath extracted -Force
-
-          $main = Get-ChildItem -Path extracted -Filter "main.py" -Recurse |
-            Select-Object -First 1
-
-          if (-not $main) {
-            Write-Error "main.py introuvable après extraction."
+          mkdir -p extracted
+          unzip -o "${{ steps.findzip.outputs.zip }}" -d extracted
+          PUBSPEC=$(find extracted -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml introuvable."
             exit 1
-          }
+          fi
+          PROJECT_ROOT=$(dirname "$PUBSPEC")
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
-          $projectRoot = Split-Path $main.FullName -Parent
-          echo "PROJECT_ROOT=$projectRoot" >> $env:GITHUB_ENV
-          Write-Host "Projet détecté : $projectRoot"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
         with:
-          python-version: "3.11"
+          distribution: temurin
+          java-version: "17"
 
-      - name: Upgrade pip
-        shell: pwsh
-        run: python -m pip install --upgrade pip
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
 
-      - name: Install dependencies
-        shell: pwsh
+      - name: Get dependencies
         run: |
-          Set-Location "$env:PROJECT_ROOT"
+          cd "$PROJECT_ROOT"
+          flutter pub get
 
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
-          } else {
-            Write-Error "requirements.txt introuvable."
-            exit 1
-          }
-
-          pip install pyinstaller
-
-      - name: Syntax check
-        shell: pwsh
+      - name: Analyze
         run: |
-          Set-Location "$env:PROJECT_ROOT"
-          python -m compileall -q .
+          cd "$PROJECT_ROOT"
+          flutter analyze --no-fatal-infos
 
-      - name: Import test
-        shell: pwsh
+      - name: Build APK
         run: |
-          Set-Location "$env:PROJECT_ROOT"
-          python -c "import file_ai_assistant.ui; print('Import OK')"
+          cd "$PROJECT_ROOT"
+          flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/File-AI-Assistant.apk"
 
-      - name: Build Windows app
-        shell: pwsh
-        run: |
-          Set-Location "$env:PROJECT_ROOT"
-
-          pyinstaller `
-            --noconfirm `
-            --clean `
-            --windowed `
-            --name "File-AI-Assistant" `
-            main.py
-
-      - name: Verify build
-        shell: pwsh
-        run: |
-          Set-Location "$env:PROJECT_ROOT"
-
-          if (!(Test-Path "dist\File-AI-Assistant\File-AI-Assistant.exe")) {
-            Write-Error "Le fichier EXE n'a pas été créé."
-            exit 1
-          }
-
-          Write-Host "Build réussi."
-          Get-Item "dist\File-AI-Assistant\File-AI-Assistant.exe"
-
-      - name: Create portable ZIP
-        shell: pwsh
-        run: |
-          Set-Location "$env:PROJECT_ROOT"
-
-          Compress-Archive `
-            -Path "dist\File-AI-Assistant\*" `
-            -DestinationPath "File-AI-Assistant-Windows.zip" `
-            -Force
-
-      - name: Upload Windows app
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: File-AI-Assistant-Windows
-          path: ${{ env.PROJECT_ROOT }}/File-AI-Assistant-Windows.zip
+          name: File-AI-Assistant-APK
+          path: File-AI-Assistant.apk
           if-no-files-found: error
           retention-days: 30
