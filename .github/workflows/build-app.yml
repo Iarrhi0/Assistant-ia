@@ -1,0 +1,127 @@
+name: Build App From ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find project ZIP
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path . -Filter "*.zip" -Recurse |
+            Where-Object { $_.Name -like "*file-ai-assistant*" } |
+            Select-Object -First 1
+
+          if (-not $zip) {
+            Write-Error "Aucun ZIP File AI Assistant trouvé dans le dépôt."
+            exit 1
+          }
+
+          echo "PROJECT_ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
+          Write-Host "ZIP trouvé : $($zip.FullName)"
+
+      - name: Unzip project
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path extracted | Out-Null
+          Expand-Archive -Path "$env:PROJECT_ZIP" -DestinationPath extracted -Force
+
+          $main = Get-ChildItem -Path extracted -Filter "main.py" -Recurse |
+            Select-Object -First 1
+
+          if (-not $main) {
+            Write-Error "main.py introuvable après extraction."
+            exit 1
+          }
+
+          $projectRoot = Split-Path $main.FullName -Parent
+          echo "PROJECT_ROOT=$projectRoot" >> $env:GITHUB_ENV
+          Write-Host "Projet détecté : $projectRoot"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        shell: pwsh
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          } else {
+            Write-Error "requirements.txt introuvable."
+            exit 1
+          }
+
+          pip install pyinstaller
+
+      - name: Syntax check
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+          python -m compileall -q .
+
+      - name: Import test
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+          python -c "import file_ai_assistant.ui; print('Import OK')"
+
+      - name: Build Windows app
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --name "File-AI-Assistant" `
+            main.py
+
+      - name: Verify build
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+
+          if (!(Test-Path "dist\File-AI-Assistant\File-AI-Assistant.exe")) {
+            Write-Error "Le fichier EXE n'a pas été créé."
+            exit 1
+          }
+
+          Write-Host "Build réussi."
+          Get-Item "dist\File-AI-Assistant\File-AI-Assistant.exe"
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          Set-Location "$env:PROJECT_ROOT"
+
+          Compress-Archive `
+            -Path "dist\File-AI-Assistant\*" `
+            -DestinationPath "File-AI-Assistant-Windows.zip" `
+            -Force
+
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-Windows
+          path: ${{ env.PROJECT_ROOT }}/File-AI-Assistant-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
