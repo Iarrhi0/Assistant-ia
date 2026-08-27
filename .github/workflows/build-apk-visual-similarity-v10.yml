@@ -1,0 +1,87 @@
+name: Build APK Visual Similarity V10
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate compatible ZIP
+        id: project
+        shell: bash
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -type f \( \
+            -name "file-ai-assistant-android10-v10-personal-ai.zip" -o \
+            -name "file-ai-assistant-android10-v9-visual-similarity.zip" \
+          \) | sort -r | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ZIP V10/V9 introuvable."
+            exit 1
+          fi
+          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "ZIP utilisé: $ZIP_FILE"
+
+      - name: Extract project
+        shell: bash
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          unzip -o "${{ steps.project.outputs.zip }}" -d extracted
+          PUBSPEC=$(find extracted -type f -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml introuvable"
+            exit 1
+          fi
+          echo "PROJECT_ROOT=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Android 10
+        shell: bash
+        run: |
+          cd "$PROJECT_ROOT"
+          cp lib/main.dart /tmp/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          rm -rf android test
+          flutter create --platforms=android --project-name file_ai_assistant --org com.fileai .
+          cp /tmp/main.dart lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+          rm -rf test
+          python tool/patch_android10.py
+
+      - name: Dependencies
+        run: |
+          cd "$PROJECT_ROOT"
+          flutter pub get
+
+      - name: Build release APK
+        run: |
+          cd "$PROJECT_ROOT"
+          flutter build apk --release
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          APK="$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$APK"
+          cp "$APK" File-AI-Assistant-V10-Android10.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-V10-Android10
+          path: File-AI-Assistant-V10-Android10.apk
+          if-no-files-found: error
+          retention-days: 30
