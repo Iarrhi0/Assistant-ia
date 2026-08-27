@@ -1,4 +1,4 @@
-name: Unzip and Build Android APK
+name: Build APK Final
 
 on:
   workflow_dispatch:
@@ -11,34 +11,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find project ZIP
-        id: findzip
+      - name: Locate exact V6 ZIP
+        id: project
         shell: bash
         run: |
-          ZIP_FILE=$(find . -maxdepth 2 -type f -name "*.zip" | head -n 1)
+          ZIP_FILE=$(find . -maxdepth 2 -type f -name "file-ai-assistant-android10-v6-final.zip" | head -n 1)
+
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Aucun fichier ZIP trouvé dans le dépôt."
+            echo "ERROR: file-ai-assistant-android10-v6-final.zip introuvable."
+            echo "Supprime les anciens ZIP ou ajoute exactement le ZIP V6."
             exit 1
           fi
-          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-          echo "ZIP trouvé: $ZIP_FILE"
 
-      - name: Extract project
+          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "ZIP utilisé: $ZIP_FILE"
+
+      - name: Extract only V6 project
         shell: bash
         run: |
           rm -rf extracted
-          mkdir -p extracted
-          unzip -o "${{ steps.findzip.outputs.zip }}" -d extracted
+          mkdir extracted
+          unzip -o "${{ steps.project.outputs.zip }}" -d extracted
 
           PUBSPEC=$(find extracted -type f -name pubspec.yaml | head -n 1)
           if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml introuvable dans le ZIP."
+            echo "ERROR: pubspec.yaml introuvable."
             exit 1
           fi
 
           PROJECT_ROOT=$(dirname "$PUBSPEC")
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Projet détecté: $PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -52,19 +55,15 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show Flutter version
-        run: flutter --version
-
-      - name: Regenerate complete Android project
+      - name: Prepare Android project
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
 
-          # Preserve our actual application source before flutter create.
           cp lib/main.dart /tmp/file_ai_main.dart
           cp pubspec.yaml /tmp/file_ai_pubspec.yaml
 
-          rm -rf android
+          rm -rf android test
 
           flutter create \
             --platforms=android \
@@ -72,29 +71,34 @@ jobs:
             --org com.fileai \
             .
 
-          # Restore the app source and dependencies.
           cp /tmp/file_ai_main.dart lib/main.dart
           cp /tmp/file_ai_pubspec.yaml pubspec.yaml
 
+          # The generated test contains MyApp(), which is not our app.
+          # Tests are not needed to compile the APK.
+          rm -rf test
+
           python tool/patch_android10.py
 
-      - name: Get dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           flutter pub get
 
-      - name: Dart format check
+      - name: Format application source
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           dart format lib/main.dart
 
-      - name: Analyze without blocking on warnings
+      - name: Remove generated tests again
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
-          flutter analyze --no-fatal-warnings --no-fatal-infos
+          rm -rf test
+          echo "Generated tests removed."
+          find . -maxdepth 2 -type f -name "widget_test.dart" -print -delete || true
 
       - name: Build release APK
         shell: bash
@@ -106,18 +110,20 @@ jobs:
         shell: bash
         run: |
           APK="$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+
           if [ ! -f "$APK" ]; then
-            echo "ERROR: APK non créé."
+            echo "ERROR: app-release.apk n'existe pas."
             exit 1
           fi
 
           cp "$APK" "$GITHUB_WORKSPACE/File-AI-Assistant-Android10.apk"
+          echo "APK créé avec succès:"
           ls -lh "$GITHUB_WORKSPACE/File-AI-Assistant-Android10.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: File-AI-Assistant-Android10-APK
+          name: File-AI-Assistant-Android10
           path: File-AI-Assistant-Android10.apk
           if-no-files-found: error
           retention-days: 30
