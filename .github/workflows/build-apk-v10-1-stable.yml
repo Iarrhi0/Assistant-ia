@@ -1,0 +1,62 @@
+name: Build APK V10.1 Stable
+on:
+  workflow_dispatch:
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find ZIP
+        id: p
+        shell: bash
+        run: |
+          Z=$(find . -maxdepth 2 -type f -name "file-ai-assistant-android10-v10-1-stable-hybrid-ai.zip" | head -1)
+          test -n "$Z"
+          echo "zip=$Z" >> "$GITHUB_OUTPUT"
+      - name: Extract
+        shell: bash
+        run: |
+          rm -rf extracted && mkdir extracted
+          unzip -o "${{ steps.p.outputs.zip }}" -d extracted
+          P=$(find extracted -name pubspec.yaml -type f | head -1)
+          test -n "$P"
+          echo "PROJECT_ROOT=$(dirname "$P")" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Prepare Android 10
+        shell: bash
+        run: |
+          cd "$PROJECT_ROOT"
+          cp lib/main.dart /tmp/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          rm -rf android test
+          flutter create --platforms=android --project-name file_ai_assistant --org com.fileai .
+          cp /tmp/main.dart lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+          rm -rf test
+          python tool/patch_android10.py
+          grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.ACCESS_NETWORK_STATE" android/app/src/main/AndroidManifest.xml
+      - name: Dependencies
+        run: cd "$PROJECT_ROOT" && flutter pub get
+      - name: Analyze
+        run: cd "$PROJECT_ROOT" && flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Build APK
+        run: cd "$PROJECT_ROOT" && flutter build apk --release
+      - name: Copy APK
+        shell: bash
+        run: |
+          A="$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$A"
+          cp "$A" File-AI-Assistant-V10.1-Android10.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-V10.1-Android10
+          path: File-AI-Assistant-V10.1-Android10.apk
+          if-no-files-found: error
