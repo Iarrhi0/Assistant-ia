@@ -1,0 +1,308 @@
+name: Universal Flutter ZIP → APK v3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect latest ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_PATH=$(
+            find . -type f -name "*.zip" \
+              ! -path "./.git/*" \
+              ! -path "./build/*" \
+              ! -path "./dist/*" \
+              ! -path "./artifacts/*" \
+              -printf '%T@ %p\n' |
+            sort -nr |
+            head -1 |
+            cut -d' ' -f2-
+          )
+          test -n "$ZIP_PATH"
+          echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ ZIP : $ZIP_PATH"
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          mkdir extracted
+          unzip -q -o "${{ steps.zip.outputs.path }}" -d extracted
+
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_ROOT=""
+          while IFS= read -r PUB; do
+            DIR=$(dirname "$PUB")
+            if [ -f "$DIR/lib/main.dart" ]; then
+              PROJECT_ROOT="$DIR"
+              break
+            fi
+          done < <(find extracted -type f -name pubspec.yaml | sort)
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "❌ Projet Flutter introuvable."
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "✅ Projet : $PROJECT_ROOT"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          test -f pubspec.yaml
+          test -f lib/main.dart
+
+          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
+            cp lib/main.dart /tmp/fileai-main.dart
+            cp pubspec.yaml /tmp/fileai-pubspec.yaml
+
+            flutter create \
+              --platforms=android \
+              --project-name file_ai_assistant \
+              --org com.fileai \
+              .
+
+            cp /tmp/fileai-main.dart lib/main.dart
+            cp /tmp/fileai-pubspec.yaml pubspec.yaml
+          fi
+
+          # Supprime uniquement le test-template Flutter cassé s'il référence MyApp
+          # alors que l'application n'a pas de classe MyApp.
+          if [ -f test/widget_test.dart ]; then
+            if grep -q "MyApp(" test/widget_test.dart && \
+               ! grep -qE 'class[[:space:]]+MyApp\b' lib/main.dart; then
+              rm -f test/widget_test.dart
+            fi
+          fi
+
+      - name: Configure Android SDKs safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          candidates = [
+              Path("android/app/build.gradle.kts"),
+              Path("android/app/build.gradle"),
+          ]
+
+          found = False
+
+          for path in candidates:
+              if not path.exists():
+                  continue
+
+              found = True
+              text = path.read_text(encoding="utf-8")
+
+              if path.suffix == ".kts":
+                  # Kotlin DSL
+                  text = re.sub(
+                      r'compileSdk\s*=\s*[^\n]+',
+                      'compileSdk = 36',
+                      text,
+                  )
+
+                  if re.search(r'minSdk\s*=', text):
+                      text = re.sub(
+                          r'minSdk\s*=\s*[^\n]+',
+                          'minSdk = 23',
+                          text,
+                      )
+
+                  # targetSdk can stay newer without changing Android 10 installability,
+                  # but use a sane explicit value.
+                  if re.search(r'targetSdk\s*=', text):
+                      text = re.sub(
+                          r'targetSdk\s*=\s*[^\n]+',
+                          'targetSdk = 35',
+                          text,
+                      )
+              else:
+                  # Groovy DSL
+                  text = re.sub(
+                      r'compileSdkVersion\s+[^\n]+',
+                      'compileSdkVersion 36',
+                      text,
+                  )
+                  text = re.sub(
+                      r'compileSdk\s+[^\n]+',
+                      'compileSdk 36',
+                      text,
+                  )
+
+                  if re.search(r'minSdkVersion\s+', text):
+                      text = re.sub(
+                          r'minSdkVersion\s+[^\n]+',
+                          'minSdkVersion 23',
+                          text,
+                      )
+
+                  if re.search(r'targetSdkVersion\s+', text):
+                      text = re.sub(
+                          r'targetSdkVersion\s+[^\n]+',
+                          'targetSdkVersion 35',
+                          text,
+                      )
+
+              path.write_text(text, encoding="utf-8")
+              print(f"✅ SDK config updated in {path}")
+
+          if not found:
+              raise SystemExit("❌ Aucun build.gradle(.kts) Android trouvé.")
+          PY
+
+      - name: Normalize Android manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          text = path.read_text(encoding="utf-8")
+
+          rx = re.compile(
+              r'\s*<uses-permission\b[^>]*android:name="([^"]+)"[^>]*/>\s*',
+              re.MULTILINE,
+          )
+
+          seen = set()
+          output = []
+          last = 0
+
+          for m in rx.finditer(text):
+              output.append(text[last:m.start()])
+              name = m.group(1)
+
+              if name not in seen:
+                  seen.add(name)
+                  output.append("\n    " + m.group(0).strip())
+
+              last = m.end()
+
+          output.append(text[last:])
+          path.write_text("".join(output), encoding="utf-8")
+          PY
+
+      - name: Verify compileSdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          if [ -f android/app/build.gradle.kts ]; then
+            grep -n "compileSdk" android/app/build.gradle.kts
+            grep -q "compileSdk = 36" android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            grep -n "compileSdk" android/app/build.gradle
+            grep -Eq "compileSdk(Version)?[[:space:]]+36" android/app/build.gradle
+          else
+            exit 1
+          fi
+
+          echo "✅ compileSdk 36 confirmé"
+
+      - name: Resolve dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          for TRY in 1 2 3; do
+            echo "flutter pub get : tentative $TRY/3"
+            if flutter pub get; then
+              exit 0
+            fi
+            [ "$TRY" -lt 3 ] && sleep $((TRY * 10))
+          done
+          exit 1
+
+      - name: Analyze app code only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter analyze lib \
+            --no-fatal-infos \
+            --no-fatal-warnings
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          for TRY in 1 2 3; do
+            echo "Build APK : tentative $TRY/3"
+
+            if flutter build apk --release; then
+              exit 0
+            fi
+
+            if [ "$TRY" -lt 3 ]; then
+              sleep $((TRY * 15))
+            fi
+          done
+
+          exit 1
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          APK=$(find build/app/outputs/flutter-apk \
+            -type f \
+            -name "*release*.apk" \
+            | head -1)
+
+          test -n "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/File-AI-Assistant.apk"
+          ls -lh "$GITHUB_WORKSPACE/File-AI-Assistant.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-APK
+          path: File-AI-Assistant.apk
+          if-no-files-found: error
+          retention-days: 30
