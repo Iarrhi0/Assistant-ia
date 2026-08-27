@@ -1,0 +1,133 @@
+name: Build APK V13.6 Dependency Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find project ZIP
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          Z=$(find . -maxdepth 2 -type f -name "file-ai-assistant-android10-v13-6-dependency-fix.zip" | head -1)
+          test -n "$Z"
+          echo "zip=$Z" >> "$GITHUB_OUTPUT"
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          mkdir extracted
+          unzip -q -o "${{ steps.project.outputs.zip }}" -d extracted
+          P=$(find extracted -type f -name pubspec.yaml | head -1)
+          test -n "$P"
+          echo "PROJECT_ROOT=$(dirname "$P")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Backup app sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          cp lib/main.dart /tmp/fileai-main.dart
+          cp pubspec.yaml /tmp/fileai-pubspec.yaml
+
+      - name: Generate Android scaffold
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          rm -rf android test
+          flutter create --platforms=android --project-name file_ai_assistant --org com.fileai .
+
+      - name: Restore app sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          cp /tmp/fileai-main.dart lib/main.dart
+          cp /tmp/fileai-pubspec.yaml pubspec.yaml
+          rm -rf test
+
+      - name: Configure Android 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = re.sub(
+              r'\s*<uses-permission\b[^>]*android:name="android\.permission\.(?:READ_EXTERNAL_STORAGE|WRITE_EXTERNAL_STORAGE)"[^>]*/>\s*',
+              '\n', text, flags=re.MULTILINE
+          )
+          permissions = (
+              '\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n'
+              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>\n'
+          )
+          pos = text.find(">")
+          if pos < 0:
+              raise RuntimeError("AndroidManifest.xml invalide")
+          text = text[:pos+1] + permissions + text[pos+1:]
+          if 'android:requestLegacyExternalStorage="true"' not in text:
+              text = text.replace(
+                  "<application",
+                  '<application\n        android:requestLegacyExternalStorage="true"',
+                  1
+              )
+          text = text.replace(
+              'android:label="file_ai_assistant"',
+              'android:label="File AI Assistant"'
+          )
+          manifest.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Resolve dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter pub get
+          flutter pub deps | grep -E '^(archive|image|file_picker) ' || true
+
+      - name: Format
+        run: cd "$PROJECT_ROOT" && dart format lib/main.dart
+
+      - name: Analyze
+        run: cd "$PROJECT_ROOT" && flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build APK
+        run: cd "$PROJECT_ROOT" && flutter build apk --release
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          cp "$APK" File-AI-Assistant-V13.6-Android10.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-V13.6-Android10
+          path: File-AI-Assistant-V13.6-Android10.apk
+          if-no-files-found: error
