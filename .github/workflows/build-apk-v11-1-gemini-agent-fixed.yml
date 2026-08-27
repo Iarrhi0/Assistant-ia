@@ -1,0 +1,89 @@
+name: Build APK V11.1 Gemini Agent Fixed
+on:
+  workflow_dispatch:
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract project (any zip)
+        shell: bash
+        run: |
+          # Works on ANY zip filename: tries every .zip found in the repo
+          # (root or 1 level deep), keeps the first one that actually
+          # contains a Flutter project (a pubspec.yaml), regardless of how
+          # it's named. No naming convention required, ever.
+          rm -rf extracted && mkdir extracted
+          FOUND=""
+
+          while IFS= read -r -d '' Z; do
+            echo "Essai : $Z"
+            TMP="$(mktemp -d)"
+            if unzip -q -o "$Z" -d "$TMP" 2>/dev/null; then
+              P="$(find "$TMP" -maxdepth 3 -type f -name pubspec.yaml | head -1)"
+              if [ -n "$P" ]; then
+                FOUND="$Z"
+                rm -rf extracted && mkdir extracted
+                cp -r "$TMP"/. extracted/
+                rm -rf "$TMP"
+                break
+              fi
+            fi
+            rm -rf "$TMP"
+          done < <(find . -maxdepth 2 -type f -iname "*.zip" -print0 | sort -z)
+
+          if [ -z "$FOUND" ]; then
+            echo "::error::Aucun .zip du repo ne contient de projet Flutter valide (pubspec.yaml introuvable dedans)."
+            echo "Fichiers .zip présents :"
+            find . -maxdepth 2 -type f -iname "*.zip"
+            exit 1
+          fi
+
+          echo "Zip utilisé : $FOUND"
+          P="$(find extracted -maxdepth 3 -type f -name pubspec.yaml | head -1)"
+          echo "PROJECT_ROOT=$(dirname "$P")" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Prepare Android 10
+        shell: bash
+        run: |
+          cd "$PROJECT_ROOT"
+          cp lib/main.dart /tmp/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          rm -rf android test
+          flutter create --platforms=android --project-name file_ai_assistant --org com.fileai .
+          cp /tmp/main.dart lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+          rm -rf test
+          python tool/patch_android10.py
+          grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.READ_EXTERNAL_STORAGE" android/app/src/main/AndroidManifest.xml
+      - name: Dependencies
+        run: cd "$PROJECT_ROOT" && flutter pub get
+      - name: Dart format check
+        shell: bash
+        run: |
+          cd "$PROJECT_ROOT"
+          dart format lib/main.dart
+          git diff --exit-code -- lib/main.dart || true
+      - name: Analyze
+        run: cd "$PROJECT_ROOT" && flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Build APK
+        run: cd "$PROJECT_ROOT" && flutter build apk --release
+      - name: Copy APK
+        shell: bash
+        run: |
+          A="$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$A"
+          cp "$A" File-AI-Assistant-V11.1-Gemini-Android10.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-V11.1-Gemini-Android10
+          path: File-AI-Assistant-V11.1-Gemini-Android10.apk
+          if-no-files-found: error
