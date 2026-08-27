@@ -1,0 +1,289 @@
+name: Universal Flutter ZIP → APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect project ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ignore ZIPs generated inside common build folders.
+          mapfile -t ZIPS < <(
+            find . -type f -name "*.zip" \
+              ! -path "./.git/*" \
+              ! -path "./build/*" \
+              ! -path "./dist/*" \
+              ! -path "./artifacts/*" \
+              -printf '%T@ %s %p\n' |
+            sort -nr
+          )
+
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "❌ Aucun fichier ZIP trouvé dans le dépôt."
+            exit 1
+          fi
+
+          echo "ZIP détectés :"
+          printf '%s\n' "${ZIPS[@]}"
+
+          # Choisit le ZIP le plus récemment modifié.
+          ZIP_PATH=$(printf '%s\n' "${ZIPS[0]}" | cut -d' ' -f3-)
+
+          echo "✅ ZIP utilisé : $ZIP_PATH"
+          echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted
+          mkdir -p extracted
+
+          unzip -q -o "${{ steps.zip.outputs.path }}" -d extracted
+
+          echo "✅ ZIP extrait."
+
+      - name: Detect Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Priorité aux pubspec.yaml ayant lib/main.dart dans le même projet.
+          PROJECT_ROOT=""
+
+          while IFS= read -r PUB; do
+            DIR=$(dirname "$PUB")
+            if [ -f "$DIR/lib/main.dart" ]; then
+              PROJECT_ROOT="$DIR"
+              break
+            fi
+          done < <(
+            find extracted -type f -name pubspec.yaml | sort
+          )
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            PUB=$(find extracted -type f -name pubspec.yaml | head -1 || true)
+
+            if [ -n "$PUB" ]; then
+              PROJECT_ROOT=$(dirname "$PUB")
+            fi
+          fi
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "❌ Aucun projet Flutter détecté."
+            echo "Il faut au minimum un pubspec.yaml."
+            exit 1
+          fi
+
+          echo "✅ Projet détecté : $PROJECT_ROOT"
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter info
+        shell: bash
+        run: |
+          flutter --version
+          dart --version
+          java -version
+
+      - name: Prepare Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          test -f pubspec.yaml
+
+          # Si lib/main.dart manque, le projet n'est pas une app Flutter exécutable.
+          if [ ! -f lib/main.dart ]; then
+            echo "❌ lib/main.dart introuvable."
+            exit 1
+          fi
+
+          # Génère Android uniquement si le projet n'en contient pas déjà.
+          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
+            echo "ℹ️ Dossier Android absent : génération automatique."
+
+            cp lib/main.dart /tmp/main.dart
+            cp pubspec.yaml /tmp/pubspec.yaml
+
+            flutter create \
+              --platforms=android \
+              --project-name file_ai_assistant \
+              --org com.fileai \
+              .
+
+            cp /tmp/main.dart lib/main.dart
+            cp /tmp/pubspec.yaml pubspec.yaml
+          else
+            echo "✅ Configuration Android déjà présente : conservée."
+          fi
+
+      - name: Normalize Android manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "❌ AndroidManifest.xml introuvable."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          text = path.read_text(encoding="utf-8")
+
+          # Déduplique toutes les permissions identiques.
+          rx = re.compile(
+              r'\s*<uses-permission\b[^>]*android:name="([^"]+)"[^>]*/>\s*',
+              re.MULTILINE
+          )
+
+          seen = set()
+          pieces = []
+          last = 0
+
+          for m in rx.finditer(text):
+              pieces.append(text[last:m.start()])
+              name = m.group(1)
+
+              if name not in seen:
+                  seen.add(name)
+                  pieces.append("\n    " + m.group(0).strip())
+
+              last = m.end()
+
+          pieces.append(text[last:])
+          text = "".join(pieces)
+
+          path.write_text(text, encoding="utf-8")
+
+          print("✅ Permissions Android dédupliquées.")
+          PY
+
+      - name: Resolve dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          flutter clean || true
+
+          # Plusieurs tentatives pour les erreurs réseau Pub.
+          for TRY in 1 2 3; do
+            echo "flutter pub get — tentative $TRY/3"
+
+            if flutter pub get; then
+              exit 0
+            fi
+
+            if [ "$TRY" -lt 3 ]; then
+              sleep $((TRY * 10))
+            fi
+          done
+
+          echo "❌ Impossible de résoudre les dépendances."
+          exit 1
+
+      - name: Format check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          dart format lib
+
+      - name: Analyze
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          flutter analyze \
+            --no-fatal-infos \
+            --no-fatal-warnings
+
+      - name: Build release APK with retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          for TRY in 1 2 3; do
+            echo "APK build — tentative $TRY/3"
+
+            if flutter build apk --release; then
+              break
+            fi
+
+            if [ "$TRY" -eq 3 ]; then
+              echo "❌ Échec du build après 3 tentatives."
+              exit 1
+            fi
+
+            echo "Nettoyage Gradle avant nouvelle tentative..."
+            rm -rf ~/.gradle/caches/modules-2/files-2.1/org.jetbrains.kotlin || true
+            rm -rf ~/.gradle/caches/modules-2/files-2.1/com.android.tools.build || true
+            sleep $((TRY * 15))
+          done
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          APK=$(find build/app/outputs/flutter-apk \
+            -type f \
+            -name "*release*.apk" \
+            | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "❌ APK release introuvable."
+            exit 1
+          fi
+
+          cp "$APK" "$GITHUB_WORKSPACE/File-AI-Assistant.apk"
+
+          echo "✅ APK : $APK"
+          ls -lh "$GITHUB_WORKSPACE/File-AI-Assistant.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: File-AI-Assistant-APK
+          path: File-AI-Assistant.apk
+          if-no-files-found: error
+          retention-days: 30
